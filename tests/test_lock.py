@@ -10,7 +10,7 @@ def test_default_connection_details_value():
     Test that RedLock instance could be created with
     default value of `connection_details` argument.
     """
-    lock = RedLock("test_simple_lock")
+    lock = RedLock("test_simple_lock")  # NOQA
 
 
 def test_simple_lock():
@@ -20,7 +20,7 @@ def test_simple_lock():
     lock = RedLock("test_simple_lock", [{"host": "localhost"}], ttl=1000)
     locked = lock.acquire()
     lock.release()
-    assert locked == True
+    assert locked is True
 
 
 def test_lock_with_validity():
@@ -31,8 +31,9 @@ def test_lock_with_validity():
     lock = RedLock("test_simple_lock", [{"host": "localhost"}], ttl=ttl)
     locked, validity = lock.acquire_with_validity()
     lock.release()
-    assert locked == True
+    assert locked is True
     assert 0 < validity < ttl - ttl * CLOCK_DRIFT_FACTOR - 2
+
 
 def test_from_url():
     """
@@ -41,7 +42,7 @@ def test_from_url():
     lock = RedLock("test_from_url", [{"url": "redis://localhost/0"}], ttl=1000)
     locked = lock.acquire()
     lock.release()
-    assert locked == True
+    assert locked is True
 
 
 def test_context_manager():
@@ -50,15 +51,19 @@ def test_context_manager():
 
     """
     ttl = 1000
-    with RedLock("test_context_manager", [{"host": "localhost"}], ttl=ttl) as validity:
+    with RedLock(
+        "test_context_manager", [{"host": "localhost"}], ttl=ttl
+    ) as validity:
         assert 0 < validity < ttl - ttl * CLOCK_DRIFT_FACTOR - 2
-        lock = RedLock("test_context_manager", [{"host": "localhost"}], ttl=ttl)
+        lock = RedLock(
+            "test_context_manager", [{"host": "localhost"}], ttl=ttl
+        )
         locked = lock.acquire()
-        assert locked == False
+        assert locked is False
 
     lock = RedLock("test_context_manager", [{"host": "localhost"}], ttl=ttl)
     locked = lock.acquire()
-    assert locked == True
+    assert locked is True
 
     # try to lock again within a with block
     try:
@@ -73,15 +78,19 @@ def test_context_manager():
 
 
 def test_fail_to_lock_acquired():
-    lock1 = RedLock("test_fail_to_lock_acquired", [{"host": "localhost"}], ttl=1000)
-    lock2 = RedLock("test_fail_to_lock_acquired", [{"host": "localhost"}], ttl=1000)
+    lock1 = RedLock(
+        "test_fail_to_lock_acquired", [{"host": "localhost"}], ttl=1000
+    )
+    lock2 = RedLock(
+        "test_fail_to_lock_acquired", [{"host": "localhost"}], ttl=1000
+    )
 
     lock1_locked = lock1.acquire()
     lock2_locked = lock2.acquire()
     lock1.release()
 
-    assert lock1_locked == True
-    assert lock2_locked == False
+    assert lock1_locked is True
+    assert lock2_locked is False
 
 
 def test_lock_expire():
@@ -92,18 +101,20 @@ def test_lock_expire():
     # Now lock1 has expired, we can accquire a lock
     lock2 = RedLock("test_lock_expire", [{"host": "localhost"}], ttl=1000)
     locked = lock2.acquire()
-    assert locked == True
+    assert locked is True
 
     lock1.release()
     lock3 = RedLock("test_lock_expire", [{"host": "localhost"}], ttl=1000)
     locked = lock3.acquire()
-    assert locked == False
+    assert locked is False
 
 
 class TestLock(unittest.TestCase):
     def setUp(self):
         super(TestLock, self).setUp()
-        self.redlock = mock.patch.object(RedLock, '__init__', return_value=None).start()
+        self.redlock = mock.patch.object(
+            RedLock, '__init__', return_value=None
+        ).start()
         self.redlock_acquire = mock.patch.object(RedLock, 'acquire').start()
         self.redlock_release = mock.patch.object(RedLock, 'release').start()
         self.redlock_acquire.return_value = True
@@ -155,13 +166,15 @@ class TestLock(unittest.TestCase):
 
 def test_lock_with_multi_backend():
     """
-    Test a RedLock can be acquired when at least N/2+1 redis instances are alive.
+    Test a RedLock can be acquired when at least N/2+1 redis instances are
+    alive.
     Set redis instance with port 6380 down or debug sleep during test.
     """
     lock = RedLock("test_simple_lock", connection_details=[
         {"host": "localhost", "port": 6379, "db": 0, "socket_timeout": 0.2},
         {"host": "localhost", "port": 6379, "db": 1, "socket_timeout": 0.2},
-        {"host": "localhost", "port": 6380, "db": 0, "socket_timeout": 0.2}], ttl=1000)
+        {"host": "localhost", "port": 6380, "db": 0, "socket_timeout": 0.2}
+        ], ttl=1000)
     locked = lock.acquire()
     lock.release()
-    assert locked == True
+    assert locked is True
