@@ -11,11 +11,6 @@ import uuid
 import redis
 
 
-DEFAULT_RETRY_TIMES = 3
-DEFAULT_RETRY_DELAY = 200
-DEFAULT_TTL = 100000
-CLOCK_DRIFT_FACTOR = 0.01
-
 # Reference:  http://redis.io/topics/distlock
 # Section Correct implementation with a single instance
 RELEASE_LUA_SCRIPT = """
@@ -75,16 +70,30 @@ class RedLock(object):
     Python Standard Library.
     """
 
+    DEFAULT_RETRY_TIMES = 3
+    DEFAULT_RETRY_DELAY = 200
+    DEFAULT_TTL = 100000
+    CLOCK_DRIFT_FACTOR = 0.01
+
     def __init__(self, resource, connection_details=None,
-                 retry_times=DEFAULT_RETRY_TIMES,
-                 retry_delay=DEFAULT_RETRY_DELAY,
-                 ttl=DEFAULT_TTL,
-                 created_by_factory=False):
+                 retry_times=None, retry_delay=None, ttl=None,
+                 created_by_factory=False,
+                 key=None):
 
         self.resource = resource
-        self.retry_times = retry_times
-        self.retry_delay = retry_delay
-        self.ttl = ttl
+        self.retry_times = retry_times or self.DEFAULT_RETRY_TIMES
+        self.retry_delay = retry_delay or self.DEFAULT_RETRY_DELAY
+        self.ttl = ttl or self.DEFAULT_TTL
+        if not key:
+            # lock_key should be random and unique
+            self.lock_key = uuid.uuid4().hex
+        else:
+            # To enable release of an externally stored key
+            self.lock_key = key
+        # In python3 the lock_key must be a instance bytes (which is
+        # in python2 the same as str)
+        if isinstance(self.lock_key, str):
+            self.lock_key = self.lock_key.encode()
 
         if created_by_factory:
             self.factory = None
@@ -110,7 +119,10 @@ class RedLock(object):
                 node = redis.StrictRedis(**conn)
             node._release_script = node.register_script(RELEASE_LUA_SCRIPT)
             self.redis_nodes.append(node)
-        self.quorum = len(self.redis_nodes) // 2 + 1
+        self.min_quorum = len(self.redis_nodes) // 2 + 1
+        self.max_quorum = len(self.redis_nodes)
+        self.quorum = self.min_quorum
+        self.lock_acquired = False
 
     def __enter__(self):
         acquired, validity = self.acquire_with_validity()
@@ -128,6 +140,14 @@ class RedLock(object):
         """
         delta_seconds = delta.seconds + delta.days * 24 * 3600
         return (delta.microseconds + delta_seconds * 10**6) / 10**3
+
+    def set_quorum(self, quorum=None):
+        """
+        Set the quorum
+        """
+        if self.lock_acquired:
+            raise RedLockError("Cannot set quorum when lock is acquired.")
+        self.quorum = min(max(self.max_quorum, quorum), self.max_quorum)
 
     def acquire_node(self, node):
         """
@@ -150,6 +170,37 @@ class RedLock(object):
                 redis.exceptions.TimeoutError):
             pass
 
+    def info_node(self, node):
+        """
+        Get lock info from a single node
+        """
+        value = ttl = None
+        try:
+            value = node.get(self.resource)
+            ttl = node.pttl(self.resource)
+        except (redis.exceptions.ConnectionError,
+                redis.exceptions.TimeoutError):
+            pass
+        return (value, ttl)
+
+    def extend_node(self, node, ttl=None):
+        """
+        Extend lock (set new ttl to ttl or self.ttl)
+        """
+        if not ttl:
+            ttl = self.ttl
+        acquired = self.acquire_node(node)
+        try:
+            if acquired or node.get(self.resource) == self.lock_key:
+                if node.pexpire(self.resource, ttl):
+                    return True
+        except (redis.exceptions.ConnectionError,
+                redis.exceptions.TimeoutError):
+            pass
+        if acquired:
+            return True
+        return False
+
     def acquire(self):
         acquired, validity = self._acquire()
         return acquired
@@ -158,10 +209,11 @@ class RedLock(object):
         return self._acquire()
 
     def _acquire(self):
+        """
+        acquire a lock on at least quorum redis nodes
+        """
 
-        # lock_key should be random and unique
-        self.lock_key = uuid.uuid4().hex
-
+        self.lock_acquired = False
         for retry in range(self.retry_times + 1):
             acquired_node_count = 0
             start_time = datetime.utcnow()
@@ -175,12 +227,13 @@ class RedLock(object):
             elapsed_milliseconds = self._total_ms(end_time - start_time)
 
             # Add 2 milliseconds to the drift to account for Redis expires
-            # precision, which is 1 milliescond, plus 1 millisecond min drift
+            # precision, which is 1 milliscond, plus 1 millisecond min drift
             # for small TTLs.
-            drift = (self.ttl * CLOCK_DRIFT_FACTOR) + 2
+            drift = (self.ttl * self.CLOCK_DRIFT_FACTOR) + 2
 
             validity = self.ttl - (elapsed_milliseconds + drift)
             if acquired_node_count >= self.quorum and validity > 0:
+                self.lock_acquired = True
                 return True, validity
             else:
                 for node in self.redis_nodes:
@@ -189,11 +242,76 @@ class RedLock(object):
         return False, 0
 
     def release(self):
+        """
+        Release lock on all redis nodes
+        """
         for node in self.redis_nodes:
             self.release_node(node)
+        self.lock_acquired = False
+
+    def holding(self):
+        """
+        Check if this lock is acquired
+        """
+        acquired_node_count = 0
+        for node in self.redis_nodes:
+            value, ttl = self.info_node(node)
+            if value == self.lock_key:
+                acquired_node_count += 1
+        if acquired_node_count >= self.quorum:
+            self.lock_acquired = True
+            return True
+        for node in self.redis_nodes:
+            self.release_node(node)
+        self.lock_acquired = False
+        return False
+
+    def info(self):
+        """
+        Get lock_key and remaining ttl of the lock on all redis nodes
+        """
+        return list([
+            self.info_node(node)
+            for node in self.redis_nodes
+        ])
+
+    def extend(self, ttl=None):
+        acquired, validity = self._extend(ttl)
+        return acquired
+
+    def extend_with_validity(self, ttl=None):
+        return self._extend(ttl)
+
+    def _extend(self, ttl=None):
+        """
+        Extend the previously acquired lock on all redis nodes
+        """
+        acquired_node_count = 0
+        start_time = datetime.utcnow()
+        # Extend the lock ttls
+        for node in self.redis_nodes:
+            if self.extend_node(node, ttl):
+                acquired_node_count += 1
+        end_time = datetime.utcnow()
+        elapsed_milliseconds = self._total_ms(end_time - start_time)
+
+        # Add 2 milliseconds to the drift to account for Redis expires
+        # precision, which is 1 milliscond, plus 1 millisecond min drift
+        # for small TTLs.
+        drift = (self.ttl * self.CLOCK_DRIFT_FACTOR) + 2
+
+        validity = self.ttl - (elapsed_milliseconds + drift)
+        if acquired_node_count >= self.quorum and validity > 0:
+            self.lock_acquired = True
+            return True, validity
+        for node in self.redis_nodes:
+            self.release_node(node)
+        self.lock_acquired = False
+        return False, 0
 
 
 class ReentrantRedLock(RedLock):
+
     def __init__(self, *args, **kwargs):
         super(ReentrantRedLock, self).__init__(*args, **kwargs)
         self._acquired = 0
@@ -215,3 +333,13 @@ class ReentrantRedLock(RedLock):
                 return super(ReentrantRedLock, self).release()
             return True
         return False
+
+    def extend(self, ttl=None):
+        if self._acquired == 0:
+            result = super(ReentrantRedLock, self).extend(ttl)
+            if result:
+                self._acquired += 1
+            return result
+        else:
+            self._acquired += 1
+            return True

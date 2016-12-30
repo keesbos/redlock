@@ -1,8 +1,9 @@
 from redlock import RedLock, ReentrantRedLock, RedLockError
-from redlock.lock import CLOCK_DRIFT_FACTOR
 import mock
 import time
 import unittest
+
+CLOCK_DRIFT_FACTOR = RedLock.CLOCK_DRIFT_FACTOR
 
 
 def test_default_connection_details_value():
@@ -107,6 +108,38 @@ def test_lock_expire():
     lock3 = RedLock("test_lock_expire", [{"host": "localhost"}], ttl=1000)
     locked = lock3.acquire()
     assert locked is False
+
+
+def test_relock():
+    lock1 = RedLock("test_relock", [{"host": "localhost"}], ttl=500)
+    lock1.acquire()
+    assert lock1.holding()
+    time.sleep(1)
+    assert not lock1.holding()
+
+    lock1.extend(500)
+    assert lock1.holding()
+    time.sleep(1)
+    assert not lock1.holding()
+
+    lock2 = RedLock(
+        "test_relock", [{"host": "localhost"}], ttl=500, key=lock1.lock_key
+    )
+    lock2.acquire()
+    assert lock2.holding()
+    time.sleep(1)
+    assert not lock2.holding()
+
+    lock3 = RedLock("test_relock", [{"host": "localhost"}], ttl=2000)
+    lock3.acquire()
+    assert lock3.holding()
+    lock2.extend(500)
+    assert not lock2.holding()
+    assert lock3.holding()
+    assert lock3.info()[0][1] <= 2000
+    lock3.extend(3000)
+    assert lock3.info()[0][1] > 2000
+    lock3.release()
 
 
 class TestLock(unittest.TestCase):
